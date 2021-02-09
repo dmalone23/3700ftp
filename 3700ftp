@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+
+# @file:         3700ftp
+# @description:  My first ftp client written from scratch
+# @author:       David Malone
+
+# Import necessary libraries
+import argparse
+import os
+import socket
+import sys
+from urllib.parse import urlparse
+
+# Parser setup
+parser = argparse.ArgumentParser(description='FTP client for listing, copying, moving, and deleting files and directories on remote FTP servers.')
+parser.add_argument(dest='operation', metavar='operation', choices=['ls', 'rm', 'rmdir', 'mkdir', 'cp', 'mv'], type=str, help='The operation to execute. Valid operations are \'ls\', \'rm\', \'rmdir\', \'mkdir\', \'cp\', and \'mv\'')
+parser.add_argument(dest='params', metavar='params', nargs='*', type=str, help='Parameters for the given operation. Will be one or two filepaths and/or URLs.')
+parser.add_argument('-v', '--verbose', action="store_true", default=False, help='Print all messages to and from the FTP server')
+
+args = parser.parse_args()
+
+if len(args.params) > 2 or len(args.params) < 1:
+    raise Exception("Unsupported number of arguments.")
+    sys.exit(1)
+
+# Socket setup
+control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+# Global variables
+user = ''
+password = ''
+hostname = ''
+port = 0
+path = ''
+length_path = ''
+
+is_sending = False
+
+rec_msg = bytearray()
+char_format = "UTF-8"
+
+default_user = 'anonymous'
+default_password = ''
+default_port = 21
+
+
+# Section: Functions sending FTP commands
+def send(to_send):
+    """Send the given message to the FTP server.
+
+    Args:
+        to_send (string): The desired FTP message
+    """
+
+    message = to_send.encode(char_format)
+    control.send(message)
+
+
+def login():
+    """Send FTP login commands to the server. If no password is provided,
+        the PASS command is not sent.
+    """
+    send(f"USER {user}\r\n")
+    print_info_if_verbose(f"USER {user}")
+    receive(control)
+    if password != '':
+        send(f"PASS {password}\r\n")
+        print_info_if_verbose(f"PASS {password}")
+        receive(control)
+
+
+def check_login_status():
+    """Check the login status of the server. If the server sends a 503 error code,
+        raise an exception and exit the program.
+
+    Raises:
+        Exception: Raised when the 503 error code (invalid credentials) is returned.
+    """
+    if "\n530" in rec_msg.decode(char_format).split(" "):
+        raise Exception("An error occured. Unable to login.")
+
+
+def mkdir():
+    """Send FTP command to create a directory with the given name.
+    """
+    send(f"MKD {path}\r\n")
+    print_info_if_verbose(f"MKD {path}")
+    receive(control)
+
+
+def rmdir():
+    """Send FTP command to remove a directory with the given name.
+    """
+    send(f"RMD {path}\r\n")
+    print_info_if_verbose(f"RMD {path}")
+    receive(control)
+
+
+def setup():
+    """Send FTP commands to set up data transfer: set data mode to 8-bit binary (TYPE I),
+        set connection to use data streams (MODE S), and set the connection to
+        file-oriented mode (STRU F).
+    """
+    send("TYPE I\r\n")
+    print_info_if_verbose("TYPE I")
+    receive(control)
+    check_login_status()
+    send("MODE S\r\n")
+    print_info_if_verbose("MODE S")
+    receive(control)
+    send("STRU F\r\n")
+    print_info_if_verbose("STRU F")
+    receive(control)
+
+
+def ls():
+    """Send FTP command to list the files/directories inside the given directory.
+    """
+    send(f"LIST {path}\r\n")
+    print_info_if_verbose(f"LIST {path}")
+    receive(control)
+    receive(stream_sock)
+
+
+def rm():
+    """Send FTP command to remove a file with the given name.
+    """
+    send(f"DELE {path}\r\n")
+    print_info_if_verbose(f"DELE {path}")
+
+
+def cp():
+    """Send FTP command to copy a file from client to server or vice versa, depending on
+        the is_sending variable.
+
+    Raises:
+        Exception: raised when an insufficient amount of arguments is provided.
+    """
+    if len(args.params) == 2:
+        if is_sending:
+            send(f"STOR {local_path}\r\n")
+            print_info_if_verbose(f"STOR {local_path}")
+            receive(control)
+            upload_file()
+        else:
+            send(f"RETR {path}\r\n")
+            print_info_if_verbose(f"RETR {path}")
+            receive(control)
+            check_550()
+            download_file()
+    else:
+        raise Exception("Insufficient arguments provided.")
+
+
+def mv():
+    """Send FTP command to move a file from client to server or vice versa (based on cp() function).
+    """
+    global local_path
+
+    cp()
+    if is_sending:
+        os.remove(local_path)
+    else:
+        rm()
+
+
+def upload_file():
+    """Upload the given file to the server.
+    """
+    global local_path
+    upload = bytearray()
+    with open(local_path, "rb") as parsing_file:
+        for line in parsing_file:
+            upload.extend(line)
+    stream_sock.send(upload)
+
+
+def download_file():
+    """Upload the given file from the server and save it on the local server.
+    """
+    global local_path
+    download_stream = bytearray()
+    while True:
+        recv = stream_sock.recv(1)
+        if not recv:
+            break
+        else:
+            download_stream.extend(recv)
+    os.system(f"touch {local_path}")
+    with open("./" + str(local_path), "wb") as downloaded_file:
+        downloaded_file.write(download_stream)
+
+
+def check_550():
+    """Check if an incorrect filename was given. If so, exit the program.
+    """
+    global rec_msg
+    codes = rec_msg.decode(char_format).split(" ")
+    if '\n550' in codes:
+
+        # The only way to exit without the program hanging!
+        sys.exit(1)
+
+
+def open_data_channel():
+    """Send FTP commands to open a data channel and save the IP address and port to the respective
+        global variables.
+    """
+    send("PASV\r\n")
+    print_info_if_verbose("PASV")
+    receive(control)
+    print()
+    get_ip_port()
+    ip_address, port = get_ip_port()
+    stream_sock.connect((ip_address, port))
+
+
+def get_ip_port():
+    """Parse the given array of values taken from the PASV server message
+        and return the data channel's IP and port.
+
+    Returns:
+        [type]: [description]
+    """
+    success_message_ip = convert_success_to_numbers(rec_msg)
+    ip_address = list_to_ip(success_message_ip[0:4])
+    port_numbers = list(map(int, success_message_ip[4:]))
+    port = (port_numbers[0] * 256) + port_numbers[1]
+    return ip_address, port
+
+
+def convert_success_to_numbers(msg):
+    """Convert the PASV success message to numbers and strip away any erroneous characters.
+
+    Args:
+        msg (string): The PASV success message
+
+    Returns:
+        list(String): The IP address and port values from the PASV success message
+    """
+    msg = msg.decode(char_format).split(" ")[4].strip("(")
+    return msg[:len(msg)-3].split(",")
+
+
+def list_to_ip(list_of_num):
+    """Take the given array of numbers and parse them into an IP address format.
+
+    Args:
+        list_of_num (list(int)): The list of integers to parse together
+
+    Returns:
+        string: The list of integers forming an IP address
+    """
+    ip_addr = ""
+    for num in list_of_num:
+        ip_addr += str(num)
+        ip_addr += "."
+    return ip_addr.strip(".")
+
+
+def quit():
+    """Send FTP commands to close connections to the server.
+    """
+    print_info_if_verbose("QUIT")
+    send("QUIT\r\n")
+    receive(control)
+    control.close()
+
+
+def receive(sock):
+    """Receive the data from the given socket and print if verbose is true.
+
+    Args:
+        sock (socket.socket()): the socket from which to read data
+
+    Returns:
+        bytearray: an array of bytes consisting of the server's response
+    """
+    global rec_msg
+
+    rec_msg = bytearray()
+    while True:
+        rec = sock.recv(1)
+        if sock is not stream_sock:
+
+            # Control socket messages terminate differently, account for that
+            if rec == b'\n' or rec is None:
+                break
+            else:
+                rec_msg.extend(rec)
+        else:
+
+            # Just break when the data stream socket runs out
+            if not rec:
+                break
+            else:
+                rec_msg.extend(rec)
+
+    # Print the important stuff to the user.
+    print_string = rec_msg.decode(char_format)
+    if sock is stream_sock:
+        try:
+            print(print_string)
+        except:
+            print("Found unprintable item.")
+    else:
+
+        # If they want to see server responses, show them
+        if args.verbose and print_string != '':
+            print(f"{print_string}\n")
+
+    return rec_msg
+
+
+def handler(param):
+    """Parses the given parameter and runs the respective command.
+
+    Args:
+        param (string): the desired command to run
+    """
+
+    # Item DOES NOT require a data channel.
+    if param == "mkdir":
+        mkdir()
+    elif param == "rmdir":
+        rmdir()
+
+    # Item DOES require a data channel.
+    else:
+        open_data_channel()
+        if param == "ls":
+            ls()
+        elif param == "rm":
+            rm()
+        elif param == "cp":
+            cp()
+        else:
+            mv()
+        stream_sock.close()
+        receive(control)
+
+
+def print_info_if_verbose(arg):
+    """Print the given message if verbose is true.
+
+    Args:
+        arg (string): The desired item to print
+    """
+    if args.verbose:
+        print(f"SENDING: {arg}")
+
+
+# Section: Functions handling CLI parameters
+def is_ftp_url(url):
+    """Determine if the given url is FTP
+
+    Args:
+        url (string): the url to parse
+
+    Returns:
+        boolean: true if the given link is an FTP url, false otherwise
+    """
+    return urlparse(url).scheme == "ftp"
+
+def invalid_args(url1, url2):
+    """Determine if the given arguments do not fit the desired pattern
+
+    Args:
+        url1 (string): the first url to parse
+        url2 (string): the first url to parse
+
+    Returns:
+        boolean: true if both urls are FTP, or one is not FTP and the other is None; false otherwise
+    """
+    return (is_ftp_url(url1) and is_ftp_url(url2)) or (not is_ftp_url(url1) and url2 is None)
+
+
+def assign_values_from_url(parsed_url):
+    """Take the parsed url and assign it to global variables.
+
+    Args:
+        parsed_url (string): the url to parse
+
+    Raises:
+        Exceptions: raised when an invalid url is given
+    """
+    parsed_url = parsed_url.netloc
+
+    global user, password, hostname, port
+    if parsed_url == '':
+        raise Exception("Invalid URL provided.")
+    else:
+        if parsed_url[0] == "@":
+            raise Exception("Invalid URL provided.")
+        if not "@" in parsed_url:
+            if not ":" in parsed_url:
+                hostname = parsed_url
+                port = default_port
+            else:
+                parsed_url_split = parsed_url.split(":")
+                hostname = parsed_url_split[0]
+                port = parsed_url_split[1]
+            if user == '' or password == '':
+                user = default_user
+                password = default_password
+        else:
+            split_link = parsed_url.split("@")
+            user_and_pass = split_link[0]
+            hostname_port = split_link[1]
+            if not ":" in user_and_pass:
+                user = user_and_pass
+            else:
+                user_pass_split = user_and_pass.split(":")
+                user = user_pass_split[0]
+                password = user_pass_split[1]
+            if not ":" in hostname_port:
+                hostname = hostname_port
+                port = default_port
+            else:
+                hostname_port_split = hostname_port.split(":")
+                hostname = hostname_port_split[0]
+                port = hostname_port_split[1]
+
+
+def handle_local_path(url):
+    """Assign value from CLI args to local_path global variable; if nothing is passed
+        then local_path is just an empty string
+
+    Args:
+        url (string): the url to parse
+
+    Returns:
+        string: the local path taken from the url
+    """
+    if url is None:
+        return ''
+    else:
+        return urlparse(url).path
+
+
+def parse_path_empty(item):
+    """Pads the path global variable with a forward slash if it's empty
+
+    Args:
+        item (stirng): the path to assign to the global variable
+    """
+    global path
+    if item == "":
+        path = "/"
+    else:
+        path = item
+
+
+def handle_individual_args(url1, url2):
+    """Complete the assigning of values to global variables using the two urls.
+
+    Args:
+        url1 (string): the first url to parse
+        url2 (string): the second url to parse
+
+    Raises:
+        Exception: raised if given arguments are invalid
+    """
+    global path, local_path, is_sending
+    url_parsed = None
+    if invalid_args(url1, url2):
+        raise Exception("Incorrect arguments given.")
+    else:
+        if is_ftp_url(url1):
+            url_parsed = urlparse(url1)
+            assign_values_from_url(url_parsed)
+            parse_path_empty(url_parsed.path)
+            local_path = handle_local_path(url2)
+            is_sending = False
+        else:
+            url_parsed = urlparse(url2)
+            assign_values_from_url(url_parsed)
+            parse_path_empty(url_parsed.path)
+            local_path = handle_local_path(url1)
+            is_sending = True
+
+
+def handle_params():
+    """Determine how to run the program based on the amount of arguments given.
+    """
+    if len(args.params) == 2:
+        handle_individual_args(args.params[0], args.params[1])
+    else:
+        handle_individual_args(args.params[0], None)
+
+
+def init():
+    """Parse parameters and connect to the server.
+    """
+    handle_params()
+    control.connect((hostname, int(port)))
+    print(f"Successfully connected to server {hostname} on port {port}.")
+
+
+# Program entry point
+if __name__ == "__main__":
+    init()
+    receive(control)
+    login()
+    setup()
+    handler(args.operation)
+    quit()
+
+# vim: set ft=python:
